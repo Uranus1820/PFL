@@ -11,7 +11,7 @@ import torch.nn.functional as F  # 函数式接口
 from sklearn import metrics  # 评估指标
 from sklearn.preprocessing import label_binarize  # 标签二值化
 from torch.utils.data import DataLoader  # 数据加载器
-
+from scipy.stats import wasserstein_distance
 # 导入项目自定义模块
 from system.utils.data_utils import read_client_data
 
@@ -342,31 +342,48 @@ class clientPFL(object):
         Returns:
             float: 数据质量分数
         """
-        # 读取训练数据
+        """
+        估计数据质量 Q_i = q_i * d_i
+        q_i: 基于 EMD (Earth Mover's Distance) 的标签分布质量
+        d_i: 数据量
+        Returns:
+            float: 数据质量分数
+        """
+        # 1. 读取训练数据并提取标签
         train_data = read_client_data(self.dataset, self.id, is_train=True)
-        # 提取所有标签
         labels = []
         for _, y in train_data:
             if isinstance(y, torch.Tensor):
                 labels.append(int(y.item()))
             else:
                 labels.append(int(y))
-
-        # 数据量
+        # 2. 计算数据量 d_i
         d_i = max(1, len(labels))
-        # 统计各类别样本数
+        # 3. 计算本地标签概率分布 P_i
         label_counts = np.bincount(labels, minlength=self.num_classes).astype(np.float64)
-        # 计算类别概率
-        prob = label_counts / max(label_counts.sum(), 1.0)
-        # 计算熵（衡量数据分布的均匀性）
-        non_zero = prob > 0
-        entropy = -np.sum(prob[non_zero] * np.log(prob[non_zero] + 1e-12))
-        # 最大熵（完全均匀分布时的熵）
-        max_entropy = math.log(min(self.num_classes, np.count_nonzero(label_counts)) or 1)
-        # 归一化熵作为质量分数（0-1之间）
-        q_i = (entropy / max_entropy) if max_entropy > 0 else 0.0
-        q_i = float(max(q_i, 1e-6))  # 避免为0
-        # 返回数据质量（质量分数 × 数据量）
+        prob_i = label_counts / max(label_counts.sum(), 1.0) # 这是 P_i
+        # --- EMD 计算开始 ---
+        # 4. 定义理想的均匀分布 P_uniform
+        p_uniform = np.full(self.num_classes, 1.0 / self.num_classes, dtype=np.float64)
+        # 5. 定义类别位置 V (从 0 到 C-1)
+        #    这是 EMD 计算所必需的“距离”定义
+        v_positions = np.arange(self.num_classes, dtype=np.float64)
+
+        # 6. 计算 EMD (Wasserstein 距离)
+        #    比较本地分布 prob_i 与 均匀分布 p_uniform 之间的距离
+        emd_i = wasserstein_distance(
+            v_positions,  # u_values (类别位置)
+            v_positions,  # v_values (类别位置)
+            prob_i,       # u_weights (本地分布)
+            p_uniform     # v_weights (均匀分布)
+        )
+        # 7. 将 EMD 映射为质量分数 q_i
+        #    EMD 越大 (越不均匀)，q_i 越小
+        #    EMD = 0 (完全均匀) -> q_i = 1.0
+        q_i = 1.0 / (1.0 + emd_i)
+        # --- EMD 计算结束 ---
+        q_i = float(max(q_i, 1e-6))  # 避免为 0
+        # 8. 返回数据质量 (质量分数 × 数据量)
         return q_i * d_i
 
     def _utility(self, alpha):
@@ -577,3 +594,27 @@ class clientPFL(object):
         if name.endswith('.weight') or name.endswith('.bias'):
             return name.rsplit('.', 1)[0]
         return name
+
+    
+    def adaptive_local_aggregation(self, 
+                            global_model: nn.Module,
+                            local_model: nn.Module,
+                            acc: float) -> None:
+        """
+        Args:
+            global_model: The received global/aggregated model. 
+            local_model: The trained local model. 
+
+        Returns:
+            None.
+        """
+
+        # obtain the references of the parameters
+        params_g = list(global_model.parameters())
+        params = list(local_model.parameters())
+
+        for param, param_g in zip(params[:-self.layer_idx], params_g[:-self.layer_idx]):
+            param.data = param_g.data.clone()
+
+        for param, param_g in zip(params[-self.layer_idx:], params_g[-self.layer_idx:]):
+            param.data = acc * param.data + (1 - acc) * param_g.data

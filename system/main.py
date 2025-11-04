@@ -150,8 +150,7 @@ if __name__ == "__main__":
                         help="基准资源消耗，每单位训练比例")
     parser.add_argument('--gmm_sigma', type=float, default=1.0,
                         help="资源感知GMM注意力权重中的带宽")
-    parser.add_argument('--resource_only_interval', type=int, default=0,
-                        help="资源聚合轮间隔(0禁用该功能)")
+  
     # 解析命令行参数
     args = parser.parse_args()
 

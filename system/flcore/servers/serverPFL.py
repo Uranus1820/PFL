@@ -45,7 +45,6 @@ class PFL(object):
 
         # 个性化相关参数
         self.layer_idx = args.layer_idx
-        self.resource_only_interval = int(getattr(args, "resource_only_interval", 0))
 
         # 模型模板与参数名称划分（用于区分 phi/psi）
         self.model_template = copy.deepcopy(args.model)
@@ -183,88 +182,107 @@ class PFL(object):
         template_state = self.model_template.state_dict()
 
         # 全局 phi 聚合（对已上传更新执行 FedAvg）
-        if self.uploaded_updates:
-            restored_list = []
-            weights = []
-            for upd in self.uploaded_updates:
-                restored = self._restore_full_state(upd, template_state)
-                restored_list.append(restored)
-                weights.append(float(max(1, upd.get('samples', 0))))
-            total_w = sum(weights) if weights else 1.0
-            global_phi = {}
-            for name in self._phi_names:
-                acc = torch.zeros_like(template_state[name])
-                for w, st in zip(weights, restored_list):
-                    acc += st[name].to(self.device) * (w / total_w)
-                global_phi[name] = acc
-            self.global_phi_state = global_phi
-        elif self.global_phi_state is None:
-            self.global_phi_state = {name: template_state[name].to(self.device) for name in self._phi_names}
+        if self.uploaded_updates:  # 若存在客户端上传的更新，则执行全局 phi 聚合
+            restored_list = []  # 存放还原到完整形状后的各客户端状态
+            weights = []  # 存放各客户端的聚合权重（通常与样本数相关）
+            for upd in self.uploaded_updates:  # 遍历每条上传记录
+                restored = self._restore_full_state(upd, template_state)  # 将稀疏/部分参数还原为完整张量
+                restored_list.append(restored)  # 记录还原后的完整状态
+                weights.append(float(max(1, upd.get('samples', 0))))  # 记录权重，至少为 1 防止为 0
+            total_w = sum(weights) if weights else 1.0  # 计算权重总和，空时置为 1.0 以免除零
+            global_phi = {}  # 保存聚合得到的全局 phi 参数
+            for name in self._phi_names:  # 遍历所有属于 phi 的参数名称
+                acc = torch.zeros_like(template_state[name])  # 初始化该参数的累计张量
+                for w, st in zip(weights, restored_list):  # 逐客户端按权重累加
+                    acc += st[name].to(self.device) * (w / total_w)  # 使用归一化权重进行加权求和
+                global_phi[name] = acc  # 写入该 phi 参数的聚合结果
+            self.global_phi_state = global_phi  # 更新服务器持有的全局 phi 状态
+        elif self.global_phi_state is None:  # 若没有上传且全局 phi 尚未初始化
+            self.global_phi_state = {name: template_state[name].to(self.device) for name in self._phi_names}  # 用模板初始化 phi
 
         # 具备 psi 向量与状态的可用客户端列表
         available_ids = [cid for cid in range(self.num_clients)
                          if self.client_psi_states.get(cid) is not None and self.client_psi_vectors.get(cid) is not None]
 
-        new_cache = {}
-        all_ids = list(range(self.num_clients))
-        for k in all_ids:
-            base_vec = self.client_psi_vectors.get(k)
-            distances = []
-            other_ids = []
-            if base_vec is not None:
-                for j in available_ids:
-                    if j == k:
+        new_cache = {}  # 用于缓存本轮计算出的个性化模型状态
+        all_ids = list(range(self.num_clients))  # 全部客户端 ID 列表
+        for k in all_ids:  # 逐个客户端计算其候选集合与个性化 psi
+            base_vec = self.client_psi_vectors.get(k)  # 客户端 k 的 psi 向量
+            distances = []  # 与其他客户端的距离列表
+            other_ids = []  # 对应的其他客户端 ID 列表
+            if base_vec is not None:  # 若 k 的 psi 向量存在
+                for j in available_ids:  # 遍历所有可用客户端
+                    if j == k:  # 跳过自身
                         continue
-                    vj = self.client_psi_vectors.get(j)
-                    if vj is None:
+                    vj = self.client_psi_vectors.get(j)  # 客户端 j 的 psi 向量
+                    if vj is None:  # 若不存在则跳过
                         continue
-                    diff = base_vec - vj
-                    d = float(np.sqrt(np.dot(diff, diff)))
-                    distances.append(d)
-                    other_ids.append(j)
+                    diff = base_vec - vj  # 差向量
+                    d = float(np.sqrt(np.dot(diff, diff)))  # 欧氏距离
+                    distances.append(d)  # 记录距离
+                    other_ids.append(j)  # 记录对应 ID
 
             # 基于距离的一维数据，用 2-GMM 划分候选集合
-            candidate_ids = []
-            if len(distances) >= 2:
-                X = np.array(distances, dtype=np.float64).reshape(-1, 1)
+            candidate_ids = []  # 候选客户端 ID 集合
+            if len(distances) >= 2:  # 至少两个距离才能拟合 2-GMM
+                X = np.array(distances, dtype=np.float64).reshape(-1, 1)  # 转为列向量
                 try:
-                    gmm = GaussianMixture(n_components=2, covariance_type='diag', random_state=0)
-                    gmm.fit(X)
-                    labels = gmm.predict(X)
-                    means = gmm.means_.reshape(-1)
-                    low_idx = int(np.argmin(means))
-                    candidate_ids = [oid for oid, lab in zip(other_ids, labels) if int(lab) == low_idx]
-                except Exception:
-                    med = float(np.median(distances))
-                    candidate_ids = [oid for oid, d in zip(other_ids, distances) if d <= med]
+                    gmm = GaussianMixture(n_components=2, covariance_type='diag', random_state=0)  # 2 分量对角协方差 GMM
+                    gmm.fit(X)  # 拟合 GMM
+                    labels = gmm.predict(X)  # 聚类标签
+                    means = gmm.means_.reshape(-1)  # 每个分量的均值
+                    low_idx = int(np.argmin(means))  # 选择均值较小的一簇（更近的集合）
+                    candidate_ids = [oid for oid, lab in zip(other_ids, labels) if int(lab) == low_idx]  # 取该簇对应的客户端
+                except Exception:  # GMM 失败时使用稳健的中位数阈值回退
+                    med = float(np.median(distances))  # 中位数
+                    candidate_ids = [oid for oid, d in zip(other_ids, distances) if d <= med]  # 取不大于中位数者
             else:
-                candidate_ids = [j for j in available_ids if j != k]
+                candidate_ids = [j for j in available_ids if j != k]  # 样本不足时，默认所有其他可用客户端为候选
 
-            # 个性化 psi 聚合（对候选集合执行 FedAvg）
-            psi_sources = []
-            psi_weights = []
-            for cid in candidate_ids:
+            # 个性化 psi 聚合（资源感知的注意力加权：基于任务相似性）
+            psi_sources = []  # 候选客户端的 psi 参数状态列表
+            candidate_vecs = []  # 候选客户端的 psi 向量（用于相似性计算）
+            for cid in candidate_ids:  # 遍历候选客户端
                 st = self.client_psi_states.get(cid)
-                if st is None:
+                vec = self.client_psi_vectors.get(cid)
+                if st is None or vec is None:
                     continue
                 psi_sources.append(st)
-                psi_weights.append(float(max(1, self.client_samples.get(cid, 0))))
+                candidate_vecs.append(np.array(vec, dtype=np.float64))
+            # 回退策略：若候选不足，使用自身；再不足，使用模板
             if not psi_sources:
                 self_state = self.client_psi_states.get(k)
-                if self_state is not None:
+                self_vec = self.client_psi_vectors.get(k)
+                if self_state is not None and self_vec is not None:
                     psi_sources = [self_state]
-                    psi_weights = [float(max(1, self.client_samples.get(k, 0)))]
+                    candidate_vecs = [np.array(self_vec, dtype=np.float64)]
                 else:
                     tmpl = {name: template_state[name].to(self.device) for name in self._psi_names}
                     psi_sources = [tmpl]
-                    psi_weights = [1.0]
+                    candidate_vecs = [np.zeros_like(np.array(list(self.client_psi_vectors.values())[0], dtype=np.float64))
+                                      if any(v is not None for v in self.client_psi_vectors.values()) else np.zeros(1, dtype=np.float64)]
 
-            total_w = float(sum(psi_weights)) if psi_weights else 1.0
+            # 计算任务相似性权重：w_i^{gmm} = exp(-||theta_{psi_i} - mu||^2 / sigma^2)
+            vec_stack = np.stack(candidate_vecs, axis=0)
+            mu_vec = np.mean(vec_stack, axis=0)  # 用候选 psi 向量的均值作为聚类中心 mu_k
+            diff = vec_stack - mu_vec
+            dist2 = np.sum(diff * diff, axis=1)  # ||theta - mu||_2^2
+            sigma2 = float(np.var(dist2))
+            if not np.isfinite(sigma2) or sigma2 <= 1e-12:
+                sigma2 = 1.0  # 退化时的稳健缺省
+            attn = np.exp(-dist2 / sigma2)
+            attn_sum = float(attn.sum())
+            if attn_sum <= 0.0 or not np.isfinite(attn_sum):
+                weights = np.full_like(attn, 1.0 / len(attn))
+            else:
+                weights = attn / attn_sum  # 归一化注意力权重
+
+            # 使用注意力权重对 psi 参数逐元素加权聚合
             personalized_psi = {}
             for name in self._psi_names:
                 acc = torch.zeros_like(template_state[name])
-                for w, st in zip(psi_weights, psi_sources):
-                    acc += st[name].to(self.device) * (w / total_w)
+                for w, st in zip(weights.tolist(), psi_sources):
+                    acc += st[name].to(self.device) * float(w)
                 personalized_psi[name] = acc
 
             # 组合全局 phi 与个性化 psi，得到每个客户端的个性化模型参数
