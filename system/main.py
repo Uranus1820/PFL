@@ -102,7 +102,9 @@ if __name__ == "__main__":
                         help="Random ratio of clients per round")  # 是否随机选择参与比例
     parser.add_argument('-nc', "--num_clients", type=int, default=20,
                         help="Total number of clients")  # 总客户端数量
-    
+    parser.add_argument('--num_clusters', type=int, default=2,
+                        help="Number of GMM clusters for personalized aggregation")
+
     # 4.5 实验控制参数
     parser.add_argument('-pv', "--prev", type=int, default=0,
                         help="Previous Running times")  # 之前运行次数
@@ -115,11 +117,20 @@ if __name__ == "__main__":
     parser.add_argument('-p', "--layer_idx", type=int, default=2,
                         help="More fine-graind than its original paper.")  # 层级索引，用于稀疏更新
 
-
-
-    #
-    parser.add_argument('-alpha', "--alpha", type=float, default=1.0,
-                        help="PFL: Resource-aware training proportion (1.0 = full training)")
+    parser.add_argument('--gamma', type=float, default=1.0,
+                        help="Client preference for performance gain in utility function")
+    parser.add_argument('--epsilon', type=float, default=1.0,
+                        help="Saturation coefficient in the contribution function")
+    parser.add_argument('--alpha_min', type=float, default=0.0,
+                        help="Minimum feasible training proportion per client")
+    parser.add_argument('--alpha_max', type=float, default=1.0,
+                        help="Maximum feasible training proportion per client")
+    parser.add_argument('--resource_cost', type=float, default=1.0,
+                        help="Baseline resource cost per unit training proportion")
+    parser.add_argument('--gmm_sigma', type=float, default=1.0,
+                        help="Bandwidth used in resource-aware GMM attention weighting")
+    parser.add_argument('--resource_only_interval', type=int, default=0,
+                        help="Interval for resource-only aggregation rounds (0 disables the feature)")
     args = parser.parse_args()
 
     # 4.7 设备环境设置
