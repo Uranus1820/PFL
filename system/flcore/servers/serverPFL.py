@@ -1,7 +1,7 @@
 import copy
 import math
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 
 import numpy as np
 import openpyxl as op
@@ -13,9 +13,16 @@ from utils.data_utils import read_client_data
 
 
 class PFL(object):
-    """服务器端执行 GMM 聚类与资源感知的个性化聚合。"""
+    """基于每客户端的两高斯混合模型（2-GMM）实现个性化的服务器。
+    - 从各客户端收集分类器（psi）参数。
+    - 对每个客户端 k，计算其与其他客户端的 psi 向量距离，并在这一维距离向量上拟合二元高斯混合模型（GMM），
+      将其他客户端划分为 候选/非候选 两组。
+    - 对候选集合执行 FedAvg 得到个性化分类器（psi）。
+    - 对特征提取器（phi）使用所有已上传的更新执行 FedAvg 得到全局 phi。
+    """
 
     def __init__(self, args, times):
+        # 基础配置
         self.device = args.device
         self.dataset = args.dataset
         self.global_rounds = args.global_rounds
@@ -24,69 +31,83 @@ class PFL(object):
         self.random_join_ratio = args.random_join_ratio
         self.join_clients = int(self.num_clients * self.join_ratio)
 
+        # 客户端列表与本轮选择结果
         self.clients = []
         self.selected_clients = []
 
+        # 评估指标缓存
         self.rs_test_acc = []
         self.rs_train_loss = []
 
+        # 训练流程控制
         self.times = times
         self.eval_gap = args.eval_gap
 
-        self.num_clusters = getattr(args, "num_clusters", 2)
+        # 个性化相关参数
         self.layer_idx = args.layer_idx
-        self.gmm_sigma = float(getattr(args, "gmm_sigma", 1.0))
         self.resource_only_interval = int(getattr(args, "resource_only_interval", 0))
 
-        self.gmm = GaussianMixture(n_components=self.num_clusters, covariance_type='diag')
-        self.gmm_fitted = False
+        # 模型模板与参数名称划分（用于区分 phi/psi）
+        self.model_template = copy.deepcopy(args.model)
+        self._param_names = [n for n, _ in self.model_template.named_parameters()]
+        self._psi_names = self._param_names[-self.layer_idx:] if self.layer_idx > 0 else []
+        self._phi_names = self._param_names[:-self.layer_idx] if self.layer_idx > 0 else self._param_names
 
-        self.cluster_models = [copy.deepcopy(args.model) for _ in range(self.num_clusters)]
-
+        # 客户端状态缓存
         self.client_psi_vectors = {i: None for i in range(self.num_clients)}
-        self.client_cluster_ids = {i: np.random.randint(0, self.num_clusters) for i in range(self.num_clients)}
+        self.client_psi_states = {i: None for i in range(self.num_clients)}
         self.client_alphas = {i: 0.0 for i in range(self.num_clients)}
         self.client_samples = {i: 0 for i in range(self.num_clients)}
 
+        # 聚合中间缓存
         self.uploaded_updates = []
         self.current_round = 0
+        self.global_phi_state = None
+        self.personalized_models_cache = {i: copy.deepcopy(self.model_template).state_dict() for i in range(self.num_clients)}
 
+        # 创建客户端实例
         self.set_clients(args, clientPFL)
 
+        # 结果记录工作簿
         self.wb = op.Workbook()
         self.ws = self.wb['Sheet']
 
         print(f"\nJoin ratio / total clients: {self.join_ratio} / {self.num_clients}")
-        print(f"GMM Clusters: {self.num_clusters}")
+        print("Two-component GMM personalization enabled")
         print("Finished creating server and clients.")
 
+        # 时间开销记录
         self.Budget = []
 
-    # ------------------------------------------------------------------
-    # 训练主流程
-    # ------------------------------------------------------------------
+    # ------------------------------
+    # 训练主循环
+    # ------------------------------
     def train(self):
         for rnd in range(self.global_rounds + 1):
             self.current_round = rnd
             s_t = time.time()
+
+            # 本轮选择参与的客户端
             self.selected_clients = self.select_clients()
 
-            if rnd > 0:
-                self.perform_gmm_clustering()
+            # 下发模型（初始为模板；之后为个性化缓存）
+            self.send_personalized_models()
 
-            self.send_cluster_models()
-
+            # 周期性评估
             if rnd % self.eval_gap == 0:
                 print(f"\n-------------Round number: {rnd}-------------")
-                print("\nEvaluate cluster models")
+                print("\nEvaluate personalized models")
                 self.evaluate(nonprint=None)
 
+            # 客户端本地训练
             for client in self.selected_clients:
                 client.train()
 
+            # 接收上传并计算下一轮个性化参数
             self.receive_pf_updates()
-            self.aggregate_cluster_models()
+            self.compute_personalized_models()
 
+            # 时间记录
             self.Budget.append(time.time() - s_t)
             print('-' * 50, self.Budget[-1])
 
@@ -95,17 +116,14 @@ class PFL(object):
         if len(self.Budget) > 1:
             print(sum(self.Budget[1:]) / len(self.Budget[1:]))
 
-    # ------------------------------------------------------------------
-    # 客户端与模型发送/接收
-    # ------------------------------------------------------------------
+    # ------------------------------
+    # 客户端管理
+    # ------------------------------
     def set_clients(self, args, clientObj):
         for i in range(self.num_clients):
             train_data = read_client_data(self.dataset, i, is_train=True)
             test_data = read_client_data(self.dataset, i, is_train=False)
-            client = clientObj(args,
-                               id=i,
-                               train_samples=len(train_data),
-                               test_samples=len(test_data))
+            client = clientObj(args, id=i, train_samples=len(train_data), test_samples=len(test_data))
             self.clients.append(client)
 
     def select_clients(self):
@@ -116,13 +134,17 @@ class PFL(object):
         selected_clients = list(np.random.choice(self.clients, join_clients, replace=False))
         return selected_clients
 
-    def send_cluster_models(self):
+    def send_personalized_models(self):
         assert self.clients
         for client in self.clients:
-            cluster_id = self.client_cluster_ids[client.id]
-            model_k = self.cluster_models[cluster_id]
-            client.set_model(model_k.state_dict())
+            state = self.personalized_models_cache.get(client.id)
+            if state is None:
+                state = self.model_template.state_dict()
+            client.set_model(state)
 
+    # ------------------------------
+    # 更新数据的收发（I/O）
+    # ------------------------------
     def receive_pf_updates(self):
         assert self.selected_clients
         self.uploaded_updates = []
@@ -132,13 +154,14 @@ class PFL(object):
             payload = client.get_pf_updates()
             psi_vector = payload['psi_vector']
 
+            # 记录客户端的最新状态
             self.client_psi_vectors[client.id] = psi_vector
+            self.client_psi_states[client.id] = payload['psi']
             self.client_alphas[client.id] = payload['alpha']
             self.client_samples[client.id] = payload['samples']
 
             update_record = {
                 'client_id': client.id,
-                'cluster': self.client_cluster_ids[client.id],
                 'phi': payload['phi'],
                 'psi': payload['psi'],
                 'psi_vector': psi_vector,
@@ -147,78 +170,125 @@ class PFL(object):
             }
             self.uploaded_updates.append(update_record)
 
-        print("GMM Vector Reception:")
+        print("Updates reception completed:")
         print('-' * 50, time.time() - s_t)
 
-    # ------------------------------------------------------------------
-    # GMM 聚类
-    # ------------------------------------------------------------------
-    def perform_gmm_clustering(self):
-        s_t = time.time()
-        psi_vectors = [vec for vec in self.client_psi_vectors.values() if vec is not None]
-        client_ids = [cid for cid, vec in self.client_psi_vectors.items() if vec is not None]
-
-        if len(psi_vectors) < self.num_clusters:
-            print("GMM Warning: 客户端数量不足以聚类，跳过本轮聚类。")
-            return
-
-        self.gmm.fit(psi_vectors)
-        self.gmm_fitted = True
-
-        labels = self.gmm.predict(psi_vectors)
-        for cid, label in zip(client_ids, labels):
-            self.client_cluster_ids[cid] = int(label)
-
-        print("GMM Clustering complete:")
-        print(f"Cluster assignment: {self.client_cluster_ids}")
-        print('-' * 50, time.time() - s_t)
-
-    # ------------------------------------------------------------------
-    # 集群模型聚合
-    # ------------------------------------------------------------------
-    def aggregate_cluster_models(self):
+    # ------------------------------
+    # 个性化聚合逻辑
+    # ------------------------------
+    def compute_personalized_models(self):
+        """基于两高斯混合模型的距离划分，计算全局 phi 与每客户端个性化 psi。"""
         s_t = time.time()
 
-        cluster_to_updates = defaultdict(list)
-        for update in self.uploaded_updates:
-            cluster_to_updates[update['cluster']].append(update)
+        template_state = self.model_template.state_dict()
 
-        for cluster_id in range(self.num_clusters):
-            updates = cluster_to_updates.get(cluster_id, [])
-            if not updates:
-                continue
-
-            template_state = self.cluster_models[cluster_id].state_dict()
-            aggregated_state = OrderedDict((name, torch.zeros_like(param)) for name, param in template_state.items())
-
+        # 全局 phi 聚合（对已上传更新执行 FedAvg）
+        if self.uploaded_updates:
+            restored_list = []
             weights = []
-            restored_states = []
-            for update in updates:
-                weight = self._compute_attention_weight(update, cluster_id)
-                if weight <= 0:
+            for upd in self.uploaded_updates:
+                restored = self._restore_full_state(upd, template_state)
+                restored_list.append(restored)
+                weights.append(float(max(1, upd.get('samples', 0))))
+            total_w = sum(weights) if weights else 1.0
+            global_phi = {}
+            for name in self._phi_names:
+                acc = torch.zeros_like(template_state[name])
+                for w, st in zip(weights, restored_list):
+                    acc += st[name].to(self.device) * (w / total_w)
+                global_phi[name] = acc
+            self.global_phi_state = global_phi
+        elif self.global_phi_state is None:
+            self.global_phi_state = {name: template_state[name].to(self.device) for name in self._phi_names}
+
+        # 具备 psi 向量与状态的可用客户端列表
+        available_ids = [cid for cid in range(self.num_clients)
+                         if self.client_psi_states.get(cid) is not None and self.client_psi_vectors.get(cid) is not None]
+
+        new_cache = {}
+        all_ids = list(range(self.num_clients))
+        for k in all_ids:
+            base_vec = self.client_psi_vectors.get(k)
+            distances = []
+            other_ids = []
+            if base_vec is not None:
+                for j in available_ids:
+                    if j == k:
+                        continue
+                    vj = self.client_psi_vectors.get(j)
+                    if vj is None:
+                        continue
+                    diff = base_vec - vj
+                    d = float(np.sqrt(np.dot(diff, diff)))
+                    distances.append(d)
+                    other_ids.append(j)
+
+            # 基于距离的一维数据，用 2-GMM 划分候选集合
+            candidate_ids = []
+            if len(distances) >= 2:
+                X = np.array(distances, dtype=np.float64).reshape(-1, 1)
+                try:
+                    gmm = GaussianMixture(n_components=2, covariance_type='diag', random_state=0)
+                    gmm.fit(X)
+                    labels = gmm.predict(X)
+                    means = gmm.means_.reshape(-1)
+                    low_idx = int(np.argmin(means))
+                    candidate_ids = [oid for oid, lab in zip(other_ids, labels) if int(lab) == low_idx]
+                except Exception:
+                    med = float(np.median(distances))
+                    candidate_ids = [oid for oid, d in zip(other_ids, distances) if d <= med]
+            else:
+                candidate_ids = [j for j in available_ids if j != k]
+
+            # 个性化 psi 聚合（对候选集合执行 FedAvg）
+            psi_sources = []
+            psi_weights = []
+            for cid in candidate_ids:
+                st = self.client_psi_states.get(cid)
+                if st is None:
                     continue
-                restored = self._restore_full_state(update, template_state)
-                weights.append(weight)
-                restored_states.append(restored)
+                psi_sources.append(st)
+                psi_weights.append(float(max(1, self.client_samples.get(cid, 0))))
+            if not psi_sources:
+                self_state = self.client_psi_states.get(k)
+                if self_state is not None:
+                    psi_sources = [self_state]
+                    psi_weights = [float(max(1, self.client_samples.get(k, 0)))]
+                else:
+                    tmpl = {name: template_state[name].to(self.device) for name in self._psi_names}
+                    psi_sources = [tmpl]
+                    psi_weights = [1.0]
 
-            if not weights:
-                continue
+            total_w = float(sum(psi_weights)) if psi_weights else 1.0
+            personalized_psi = {}
+            for name in self._psi_names:
+                acc = torch.zeros_like(template_state[name])
+                for w, st in zip(psi_weights, psi_sources):
+                    acc += st[name].to(self.device) * (w / total_w)
+                personalized_psi[name] = acc
 
-            total_weight = sum(weights)
-            for w, state in zip(weights, restored_states):
-                for name in aggregated_state:
-                    aggregated_state[name] += state[name].to(self.device) * (w / total_weight)
+            # 组合全局 phi 与个性化 psi，得到每个客户端的个性化模型参数
+            combined = OrderedDict()
+            for name in template_state:
+                if name in self._phi_names:
+                    combined[name] = self.global_phi_state[name]
+                elif name in self._psi_names:
+                    combined[name] = personalized_psi[name]
+                else:
+                    combined[name] = template_state[name].to(self.device)
+            new_cache[k] = combined
 
-            self.cluster_models[cluster_id].load_state_dict(aggregated_state)
-
-        print("Aggregate clusters:")
+        self.personalized_models_cache = new_cache
+        print("Personalized aggregation complete:")
         print('-' * 50, time.time() - s_t)
 
+    # ------------------------------
+    # 稀疏还原的实用函数
+    # ------------------------------
     def _restore_full_state(self, update, template_state):
         restored = OrderedDict()
         phi_updates = update['phi']
         psi_updates = update['psi']
-
         for name, template_tensor in template_state.items():
             if name in psi_updates:
                 tensor = psi_updates[name].to(template_tensor.device, dtype=template_tensor.dtype)
@@ -233,7 +303,6 @@ class PFL(object):
         target = torch.zeros_like(template_tensor)
         indices = info['indices']
         values = info['values']
-
         if indices is None:
             data = values.to(template_tensor.device, dtype=template_tensor.dtype)
             if data.shape == target.shape:
@@ -241,50 +310,31 @@ class PFL(object):
             else:
                 target.copy_(data.view_as(target))
             return target
-
         if isinstance(indices, torch.Tensor):
             indices_tensor = indices.to(torch.long)
         else:
             indices_tensor = torch.tensor(indices, dtype=torch.long)
-
         if indices_tensor.numel() == 0:
             return target
-
         data = values.to(template_tensor.device, dtype=template_tensor.dtype)
         slicer = [indices_tensor.to(template_tensor.device)] + [slice(None)] * (target.dim() - 1)
         target[tuple(slicer)] = data
         return target
 
-    def _compute_attention_weight(self, update, cluster_id):
-        alpha = max(0.0, float(update['alpha']))
-        if alpha <= 0:
-            return 0.0
-
-        if self.resource_only_interval > 0 and self.current_round % self.resource_only_interval == 0:
-            return alpha
-
-        if not self.gmm_fitted or not hasattr(self.gmm, 'means_'):
-            return alpha
-
-        sigma_sq = max(1e-12, self.gmm_sigma ** 2)
-        mu_k = self.gmm.means_[cluster_id]
-        diff = update['psi_vector'] - mu_k
-        dist_sq = float(np.dot(diff, diff))
-        w_gmm = math.exp(-dist_sq / sigma_sq)
-        return alpha * w_gmm
-
-    # ------------------------------------------------------------------
-    # 评估与监控
-    # ------------------------------------------------------------------
+    # ------------------------------
+    # 评估辅助函数
+    # ------------------------------
     def test_metrics(self):
         num_samples = []
         tot_correct = []
         tot_auc = []
         accs = []
         for client in self.clients:
-            cluster_id = self.client_cluster_ids[client.id]
-            model_k = self.cluster_models[cluster_id]
-            ct, ns, auc = client.test_metrics(model=model_k)
+            model_state = self.personalized_models_cache.get(client.id)
+            temp_model = copy.deepcopy(self.model_template)
+            if model_state is not None:
+                temp_model.load_state_dict(model_state)
+            ct, ns, auc = client.test_metrics(model=temp_model)
             tot_correct.append(ct * 1.0)
             tot_auc.append(auc * ns)
             num_samples.append(ns)
@@ -296,9 +346,11 @@ class PFL(object):
         num_samples = []
         losses = []
         for client in self.clients:
-            cluster_id = self.client_cluster_ids[client.id]
-            model_k = self.cluster_models[cluster_id]
-            cl, ns = client.train_metrics(model=model_k)
+            model_state = self.personalized_models_cache.get(client.id)
+            temp_model = copy.deepcopy(self.model_template)
+            if model_state is not None:
+                temp_model.load_state_dict(model_state)
+            cl, ns = client.train_metrics(model=temp_model)
             num_samples.append(ns)
             losses.append(cl * 1.0)
         ids = [c.id for c in self.clients]
@@ -307,13 +359,11 @@ class PFL(object):
     def evaluate(self, acc=None, loss=None, nonprint=None):
         stats = self.test_metrics()
         stats_train = self.train_metrics()
-
         test_acc = sum(stats[2]) * 1.0 / max(sum(stats[1]), 1)
         test_auc = sum(stats[3]) * 1.0 / max(sum(stats[1]), 1)
         train_loss = sum(stats_train[2]) * 1.0 / max(sum(stats_train[1]), 1)
         accs = [a / n if n > 0 else 0.0 for a, n in zip(stats[2], stats[1])]
         aucs = [a / n if n > 0 else 0.0 for a, n in zip(stats[3], stats[1])]
-
         if nonprint is None:
             if acc is None:
                 self.rs_test_acc.append(test_acc)
@@ -336,3 +386,4 @@ class PFL(object):
 
     def get_parameters(self, model):
         return [val.data.cpu().numpy() for val in model.parameters()]
+

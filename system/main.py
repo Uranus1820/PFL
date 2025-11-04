@@ -1,17 +1,21 @@
+# 导入必要的库
 import torch
-import argparse
-import os
-import time
-import warnings
-import numpy as np
-import torchvision
+import argparse  # 命令行参数解析
+import os  # 操作系统接口
+import time  # 时间相关功能
+import warnings  # 警告处理
+import numpy as np  # 数值计算库
+import torchvision  # PyTorch视觉库
 
-import multiprocessing
+import multiprocessing  # 多进程支持
 
-from flcore.servers.serverPFL import PFL
-from flcore.trainmodel.models import *
+# 导入项目自定义模块
+from flcore.servers.serverPFL import PFL  # 服务器端PFL算法
+from flcore.trainmodel.models import *  # 模型定义
 
+# 忽略警告信息
 warnings.simplefilter("ignore")
+# 设置随机种子以确保结果可复现
 torch.manual_seed(0)
 
 # hyper-params for AG News
@@ -20,14 +24,23 @@ max_len = 200       # 文本最大长度
 hidden_dim = 32     # 隐藏层维度
 
 def run(args):
-
+    """
+    主运行函数，执行联邦学习训练流程
+    
+    Args:
+        args: 包含所有训练参数的命名空间对象
+    """
+    # 记录每次运行的时间
     time_list = []
+    # 保存原始模型字符串
     model_str = args.model
     args.model_str = model_str
 
+    # 循环执行多次实验（从prev次到times次）
     for i in range(args.prev, args.times):
         print(f"\n============= Running time: {i}th =============")
         print("Creating server and clients ...")
+        # 记录开始时间
         start = time.time()
 
         # Generate args.model
@@ -54,6 +67,7 @@ def run(args):
         else:
             raise NotImplementedError
                             
+        # 打印模型结构
         print(args.model)
         
 
@@ -61,21 +75,28 @@ def run(args):
             server = PFL(args, i)
         else:
             raise NotImplementedError
-            
+        
+        # 开始训练
         server.train()
         
+        # 可选：清空CUDA缓存以释放显存
         # torch.cuda.empty_cache()
 
+        # 记录本次运行耗时
         time_list.append(time.time()-start)
 
+    # 打印平均运行时间
     print(f"\nAverage time cost: {round(np.average(time_list), 2)}s.")
 
     print("All done!")
 
 
 if __name__ == "__main__":
+    # 记录程序开始时间
     total_start = time.time()
+    # 设置多进程启动方法为spawn（Windows系统推荐）
     torch.multiprocessing.set_start_method('spawn')
+    # 创建命令行参数解析器
     parser = argparse.ArgumentParser()
     # general
     parser.add_argument('-dev', "--device", type=str, default="cuda",
@@ -116,21 +137,22 @@ if __name__ == "__main__":
     # 4.6 FLAYER算法特定参数
     parser.add_argument('-p', "--layer_idx", type=int, default=2,
                         help="More fine-graind than its original paper.")  # 层级索引，用于稀疏更新
-
+    # 4.7 资源感知聚合参数
     parser.add_argument('--gamma', type=float, default=1.0,
-                        help="Client preference for performance gain in utility function")
+                        help="客户对效用函数中性能提升的偏好")
     parser.add_argument('--epsilon', type=float, default=1.0,
-                        help="Saturation coefficient in the contribution function")
+                        help="饱和系数，用于贡献函数")
     parser.add_argument('--alpha_min', type=float, default=0.0,
-                        help="Minimum feasible training proportion per client")
+                        help="客户端最小可行的训练比例")
     parser.add_argument('--alpha_max', type=float, default=1.0,
-                        help="Maximum feasible training proportion per client")
+                        help="客户端最大可行的训练比例")
     parser.add_argument('--resource_cost', type=float, default=1.0,
-                        help="Baseline resource cost per unit training proportion")
+                        help="基准资源消耗，每单位训练比例")
     parser.add_argument('--gmm_sigma', type=float, default=1.0,
-                        help="Bandwidth used in resource-aware GMM attention weighting")
+                        help="资源感知GMM注意力权重中的带宽")
     parser.add_argument('--resource_only_interval', type=int, default=0,
-                        help="Interval for resource-only aggregation rounds (0 disables the feature)")
+                        help="资源聚合轮间隔(0禁用该功能)")
+    # 解析命令行参数
     args = parser.parse_args()
 
     # 4.7 设备环境设置
